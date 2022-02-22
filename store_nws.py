@@ -1,0 +1,230 @@
+import sqlite3
+from datetime import timedelta
+
+import requests
+import pandas as pd
+from dateutil.tz import gettz
+from dateutil.parser import parse
+from prefect import Flow, Parameter, task
+from prefect.schedules import IntervalSchedule
+from prefect.engine.results import LocalResult
+
+DATABASE_PATH = "forecast.db"
+TABLE_QUERY = "SELECT name FROM sqlite_master WHERE type='table' AND name='updates';"
+UPDATES_QUERY = "SELECT stn_id FROM updates WHERE source='nws' AND update_dt=? LIMIT 1"
+
+METADATA_URL = (
+    "https://mesonet.agron.iastate.edu/sites/networks.php?"
+    "network=_ALL_&format=csv&nohtml=on"
+)
+
+DATA_FMT = (
+    "https://forecast.weather.gov/MapClick.php?"
+    "lat={lat}&lon={lon}&lg=english&&FcstType=digital"
+)
+
+TZINFOS = {
+    "PST": gettz("US/Pacific"),
+    "PDT": gettz("US/Pacific"),
+    "PT": gettz("US/Pacific"),
+    "MST": gettz("US/Mountain"),
+    "MDT": gettz("US/Mountain"),
+    "MT": gettz("US/Mountain"),
+    "CST": gettz("US/Central"),
+    "CDT": gettz("US/Central"),
+    "CT": gettz("US/Central"),
+    "EST": gettz("US/Eastern"),
+    "EDT": gettz("US/Eastern"),
+    "ET": gettz("US/Eastern"),
+}
+
+@task(max_retries=3, retry_delay=timedelta(minutes=1), target="stn_meta.csv", checkpoint=True, result=LocalResult(dir="~/.prefect"))
+def retreive_meta():
+    stn_df = pd.read_csv(METADATA_URL)
+    return stn_df
+
+
+@task(nout=2)
+def lookup_lat_lon(stn_df, stn_id):
+    """
+    Lookup lat / lon for a given station id.
+    """
+    stn_row = stn_df.query(f"stid == '{stn_id}'").iloc[0]
+    return stn_row["lat"], stn_row["lon"]
+
+
+@task(max_retries=3, retry_delay=timedelta(minutes=1))
+def retrieve_data(lat, lon):
+    """
+    Get tabular data from NWS.
+    """
+    df_list = pd.read_html(DATA_FMT.format(lat=lat, lon=lon))
+    return df_list
+
+
+def _to_utc(time):
+    """
+    Convert timezone aware datetimes into UTC.
+    """
+    return pd.to_datetime(parse(time, tzinfos=TZINFOS)).tz_convert("UTC")
+
+
+@task(nout=2)
+def check_exists(df_list):
+    """
+    Check if data already exists in database; if so, skip.
+    """
+    _, update_time = df_list[3].iloc[0]
+    update_dt = _to_utc(update_time.split(":", 1)[1])
+
+    update_needed = True
+    with sqlite3.connect(DATABASE_PATH) as con:
+        table_exists = len(pd.read_sql(TABLE_QUERY, con)) > 0
+        if table_exists:
+            update_df = pd.read_sql(
+                UPDATES_QUERY,
+                con,
+                params=[update_dt.strftime("%Y-%m-%d %H:%M:%S")],
+            )
+            if len(update_df) > 0:
+                update_needed = False
+    return update_dt, update_needed
+
+
+@task
+def subset_forecast(df_list):
+    """
+    Subset the forecast dataframe.
+    """
+    df = df_list[7].T
+    return df
+
+
+@task
+def drop_empty(df):
+    """
+    Remove empty columns.
+    """
+    df = df.drop(columns=[0, 17])
+    return df
+
+
+@task
+def rename_columns(df):
+    """
+    Replace the first row as column names,
+    lowercasing the column names, removing text in parentheses,
+    and replacing spaces with underscores.
+    """
+    df.columns = (
+        df.iloc[0]
+        .str.lower()
+        .str.split("(", expand=True)[0]
+        .str.strip()
+        .str.replace(" ", "_")
+    )
+    df = df.drop([0])
+    return df
+
+
+@task
+def rejoin_data(df):
+    """
+    The two tables were mangled as separate columns in the same df
+    so re-separate them and join them as rows.
+    """
+    df = pd.concat([df.iloc[:, :16], df.iloc[:, 16:]]).ffill()
+    return df
+
+
+def _get_tau(df, update_dt):
+    """
+    Gets forecast step as hours.
+    """
+    return (df.index - update_dt).total_seconds() / 60 / 60
+
+
+@task
+def parse_timę(df, update_dt):
+    """
+    Create a datetime object from dataframe columns.
+    """
+    df.index = [
+        _to_utc(f"{update_dt.year}/{row['date']} {row['hour']}, {update_dt.tzname()}")
+        for _, row in df.iterrows()
+    ]
+    df = df.drop(columns=["date", "hour"])
+    df["tau"] = _get_tau(df, update_dt)
+    return df
+
+
+@task
+def fix_time(df, update_dt):
+    """
+    Since the year is inferred, add some logic to correct it during a new year.
+    """
+    df["valid"] = df.index
+    rewind_idx = df["tau"] > 100 * 24
+    df.loc[rewind_idx, "valid"] = df.loc[rewind_idx].index - pd.DateOffset(years=1)
+
+    forward_idx = df["tau"] < -100 * 24
+    df.loc[forward_idx, "valid"] = df.loc[forward_idx].index + pd.DateOffset(years=1)
+
+    df.index = df["valid"]
+    df = df.drop(columns="valid")
+    df["tau"] = _get_tau(df, update_dt)
+    return df
+
+
+@task
+def export_data(df):
+    """
+    Save forecast data to database.
+    
+    """
+    with sqlite3.connect(DATABASE_PATH) as con:
+        df.to_sql("nws", con, if_exists="append")
+
+
+@task
+def export_metadata(stn_id, update_dt):
+    """
+    Save forecast data to database.
+    """
+    with sqlite3.connect(DATABASE_PATH) as con:
+        pd.DataFrame(
+            {
+                "stn_id": [stn_id],
+                "source": ["nws"],
+                "update_dt": [update_dt.tz_localize(None)],
+            }
+        ).set_index("stn_id").to_sql("updates", con, if_exists="append")
+
+
+if __name__ == "__main__":
+    schedule = IntervalSchedule(interval=timedelta(minutes=30))
+    with Flow("store_nws", schedule=schedule) as flow:
+        stn_id = Parameter("stn_id", default="CMI")
+        stn_df = retreive_meta()
+        lat, lon = lookup_lat_lon(stn_df, stn_id)
+        df_list = retrieve_data(lat, lon)
+        update_dt, update_needed = check_exists(df_list)
+        if not update_needed:
+            print(f"{update_dt} for {stn_id} already exists.")
+        else:
+            df = subset_forecast(df_list)
+            df = drop_empty(df)
+            df = rename_columns(df)
+            df = rejoin_data(df)
+            df = parse_timę(df, update_dt)
+            df = fix_time(df, update_dt)
+
+            update_dt, update_needed = check_exists(df_list)
+            if update_needed:
+                # if concurrent limits is set
+                export_metadata(stn_id, update_dt)
+                export_data(df)
+            else:
+                print(f"{update_dt} for {stn_id} already exists.")
+
+    flow.register("forecast_verification")
