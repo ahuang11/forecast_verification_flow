@@ -5,9 +5,10 @@ import requests
 import pandas as pd
 from dateutil.tz import gettz
 from dateutil.parser import parse
-from prefect import Flow, Parameter, task
+from prefect import Flow, Parameter, task, unmapped
 from prefect.schedules import IntervalSchedule
 from prefect.engine.results import LocalResult
+from prefect.engine.signals import SKIP
 
 DATABASE_PATH = "forecast.db"
 TABLE_QUERY = "SELECT name FROM sqlite_master WHERE type='table' AND name='updates';"
@@ -38,27 +39,32 @@ TZINFOS = {
     "ET": gettz("US/Eastern"),
 }
 
-@task(max_retries=3, retry_delay=timedelta(minutes=1), target="stn_meta.csv", checkpoint=True, result=LocalResult(dir="~/.prefect"))
+@task(max_retries=3,
+      retry_delay=timedelta(minutes=1),
+      target="stn_meta.csv",
+      checkpoint=True,
+      result=LocalResult(dir="~/.prefect")
+      )
 def retreive_meta():
     stn_df = pd.read_csv(METADATA_URL)
     return stn_df
 
 
-@task(nout=2)
+@task
 def lookup_lat_lon(stn_df, stn_id):
     """
     Lookup lat / lon for a given station id.
     """
     stn_row = stn_df.query(f"stid == '{stn_id}'").iloc[0]
-    return stn_row["lat"], stn_row["lon"]
+    return {"lat": stn_row["lat"], "lon": stn_row["lon"]}
 
 
 @task(max_retries=3, retry_delay=timedelta(minutes=1))
-def retrieve_data(lat, lon):
+def retrieve_data(coords):
     """
     Get tabular data from NWS.
     """
-    df_list = pd.read_html(DATA_FMT.format(lat=lat, lon=lon))
+    df_list = pd.read_html(DATA_FMT.format(**coords))
     return df_list
 
 
@@ -69,7 +75,7 @@ def _to_utc(time):
     return pd.to_datetime(parse(time, tzinfos=TZINFOS)).tz_convert("UTC")
 
 
-@task(nout=2)
+@task
 def check_exists(df_list):
     """
     Check if data already exists in database; if so, skip.
@@ -77,7 +83,6 @@ def check_exists(df_list):
     _, update_time = df_list[3].iloc[0]
     update_dt = _to_utc(update_time.split(":", 1)[1])
 
-    update_needed = True
     with sqlite3.connect(DATABASE_PATH) as con:
         table_exists = len(pd.read_sql(TABLE_QUERY, con)) > 0
         if table_exists:
@@ -87,8 +92,9 @@ def check_exists(df_list):
                 params=[update_dt.strftime("%Y-%m-%d %H:%M:%S")],
             )
             if len(update_df) > 0:
-                update_needed = False
-    return update_dt, update_needed
+                raise SKIP()
+
+    return update_dt
 
 
 @task
@@ -170,8 +176,7 @@ def fix_time(df, update_dt):
     forward_idx = df["tau"] < -100 * 24
     df.loc[forward_idx, "valid"] = df.loc[forward_idx].index + pd.DateOffset(years=1)
 
-    df.index = df["valid"]
-    df = df.drop(columns="valid")
+    df = df.set_index("valid")
     df["tau"] = _get_tau(df, update_dt)
     return df
 
@@ -201,30 +206,24 @@ def export_metadata(stn_id, update_dt):
         ).set_index("stn_id").to_sql("updates", con, if_exists="append")
 
 
-if __name__ == "__main__":
-    schedule = IntervalSchedule(interval=timedelta(minutes=30))
-    with Flow("store_nws", schedule=schedule) as flow:
-        stn_id = Parameter("stn_id", default="CMI")
-        stn_df = retreive_meta()
-        lat, lon = lookup_lat_lon(stn_df, stn_id)
-        df_list = retrieve_data(lat, lon)
-        update_dt, update_needed = check_exists(df_list)
-        if not update_needed:
-            print(f"{update_dt} for {stn_id} already exists.")
-        else:
-            df = subset_forecast(df_list)
-            df = drop_empty(df)
-            df = rename_columns(df)
-            df = rejoin_data(df)
-            df = parse_timę(df, update_dt)
-            df = fix_time(df, update_dt)
+schedule = IntervalSchedule(interval=timedelta(minutes=30))
+with Flow("store_nws", schedule=schedule, labels=["nws"]) as flow:
+    stn_ids = Parameter("stn_id", default=["CMI", "ORD", "SEA"])
 
-            update_dt, update_needed = check_exists(df_list)
-            if update_needed:
-                # if concurrent limits is set
-                export_metadata(stn_id, update_dt)
-                export_data(df)
-            else:
-                print(f"{update_dt} for {stn_id} already exists.")
+    stn_df = retreive_meta()
+    coords = lookup_lat_lon.map(unmapped(stn_df), stn_ids)
 
-    flow.register("forecast_verification")
+    df_list = retrieve_data.map(coords)
+    update_dt = check_exists.map(df_list)
+
+    df = subset_forecast.map(df_list)
+    df = drop_empty.map(df)
+    df = rename_columns.map(df)
+    df = rejoin_data.map(df)
+    df = parse_timę.map(df, update_dt)
+    df = fix_time.map(df, update_dt)
+
+    export_metadata.map(stn_ids, update_dt)
+    export_data.map(df)
+
+flow.register("forecast_verification")
