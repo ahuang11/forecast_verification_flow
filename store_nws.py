@@ -9,6 +9,7 @@ from prefect import Flow, Parameter, task, unmapped
 from prefect.schedules import IntervalSchedule
 from prefect.engine.results import LocalResult
 from prefect.engine.signals import SKIP
+from prefect.run_configs import UniversalRun
 
 DATABASE_PATH = "forecast.db"
 TABLE_QUERY = "SELECT name FROM sqlite_master WHERE type='table' AND name='updates';"
@@ -207,7 +208,8 @@ def export_metadata(stn_id, update_dt):
 
 
 schedule = IntervalSchedule(interval=timedelta(minutes=30))
-with Flow("store_nws", schedule=schedule, labels=["nws"]) as flow:
+with Flow("store_nws", schedule=schedule) as flow:
+    flow.run_config = UniversalRun(labels=["nws"])
     stn_ids = Parameter("stn_id", default=["CMI", "ORD", "SEA"])
 
     stn_df = retreive_meta()
