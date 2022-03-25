@@ -126,7 +126,7 @@ def to_database(stid, df):
 
 
 @flow
-def process_forecast(stid):
+def process_forecast(stid: str):
     stid = stid.upper()
 
     meta_df = retrieve_meta()
