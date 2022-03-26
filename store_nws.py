@@ -1,12 +1,14 @@
+from typing import Tuple
 import sqlite3
 import xml.etree.cElementTree as et
 from collections import defaultdict
 from io import StringIO
 from datetime import timedelta
+from pathlib import Path
 
 import pandas as pd
 import requests
-from prefect import flow, task
+from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from prefect.orion.schemas.schedules import IntervalSchedule
 from prefect.deployments import DeploymentSpec
@@ -19,6 +21,8 @@ META_URL = (
 DATA_URL_FMT = "https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&FcstType=digitalDWML"
 TEMPORAL_COLS = ("start_valid_time", "initialization_time", "forecast_hour")
 DATABASE_NAME = "nws_forecast.db"
+DATABASE_DIR = Path(__file__).parent.absolute() / "data"
+DATABASE_PATH = DATABASE_DIR / DATABASE_NAME
 STATION_IDS = ("KSEA", "KBDU", "KORD", "KCMI", "KMRY", "KSAN", "KNYC", "KIND", "KHOU")
 
 
@@ -29,7 +33,7 @@ def retrieve_meta():
 
 
 @task(cache_key_fn=task_input_hash)
-def get_station_coords(meta_df, stid):
+def get_station_coords(stid, meta_df):
     lon, lat = meta_df.loc[meta_df["stid"] == stid, ["lon", "lat"]].iloc[0]
     return lon, lat
 
@@ -55,12 +59,22 @@ def extract_initialization_time(root):
     for head in root.findall("head"):
         for product in head.findall("product"):
             for creation_date in product.findall("creation-date"):
-                initialization_time = [creation_date.text]
+                initialization_time = pd.to_datetime(creation_date.text)
     return initialization_time
 
 
-@task
-def check_if_exists(initialization_time):
+@task(retries=3, retry_delay_seconds=10)
+def check_if_exists(stid, initialization_time):
+    logger = get_run_logger()
+    try:
+        with sqlite3.connect(DATABASE_PATH) as con:
+            row = con.execute(f"SELECT initialization_time FROM {stid} ORDER BY rowid DESC LIMIT 1;")
+            existing_initialization_time = pd.to_datetime(row.fetchone()[0])
+            if existing_initialization_time == initialization_time:
+                logger.info(f"{initialization_time} already exists in the database for {stid}, skipping")
+                return True
+    except sqlite3.OperationalError:
+        pass
     return False
 
 
@@ -99,14 +113,14 @@ def extract_params(root):
 def create_df(mapping, initialization_time):
     df = pd.DataFrame(mapping).pipe(
         lambda df: df.assign(**{
-            "initialization_time": pd.to_datetime(initialization_time),
+            "initialization_time": pd.to_datetime([initialization_time] * len(df)),
             "start_valid_time": pd.to_datetime(df["start_valid_time"])
         })
     ).pipe(
         lambda df: df.assign(**{
             "forecast_hour": (
-                df["initialization_time"] - df["start_valid_time"]
-            ).total_seconds() / 3600
+                df["start_valid_time"] - df["initialization_time"]
+            ).dt.total_seconds() / 3600
         })
     ).set_index(
         ["start_valid_time", "initialization_time"]
@@ -117,35 +131,36 @@ def create_df(mapping, initialization_time):
     return df
 
 
-@task
+@task(retries=3, retry_delay_seconds=10)
 def to_database(stid, df):
-    with sqlite3.connect(DATABASE_NAME) as con:
+    DATABASE_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_PATH) as con:
         df.to_sql(stid, con, index=False, if_exists="append")
         for col in TEMPORAL_COLS:
-            con.execute(f"CREATE INDEX {col}_index ON {stid}({col});")
+            con.execute(f"CREATE INDEX IF NOT EXISTS {col}_index ON {stid}({col});")
 
 
 @flow
-def process_forecast(stid: str):
-    stid = stid.upper()
+def process_forecasts(stids: Tuple = STATION_IDS):
+    for stid in stids:
+        stid = stid.upper()
 
-    meta_df = retrieve_meta()
-    lon, lat = get_station_coords(meta_df, stid).result()
+        meta_df = retrieve_meta()
+        lon, lat = get_station_coords(stid, meta_df).result()
 
-    data = retrieve_data(lon, lat)
-    root = get_root(data)
-    initialization_time = extract_initialization_time(root)
-    exists = check_if_exists(initialization_time)
-    if not exists:
-        mapping = extract_params(root)
-        df = create_df(mapping, initialization_time)
-        to_database(stid, df)
+        data = retrieve_data(lon, lat)
+        root = get_root(data)
+        initialization_time = extract_initialization_time(root)
+        exists = check_if_exists(stid, initialization_time)
+        if not exists.result():
+            mapping = extract_params(root)
+            df = create_df(mapping, initialization_time)
+            to_database(stid, df)
 
 
 DeploymentSpec(
-    flow=process_forecast,
-    name="process-forecast-hourly",
-    parameters={"stid": STATION_IDS},
+    flow=process_forecasts,
+    name="hourly-deployment",
     tags=["nws", "forecast"],
     schedule=IntervalSchedule(interval=timedelta(hours=1)),
 )
