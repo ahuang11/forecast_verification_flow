@@ -21,7 +21,7 @@ META_URL = (
 DATA_URL_FMT = "https://forecast.weather.gov/MapClick.php?lat={lat}&lon={lon}&FcstType=digitalDWML"
 TEMPORAL_COLS = ("start_valid_time", "initialization_time", "forecast_hour")
 DATABASE_NAME = "nws_forecast.db"
-DATABASE_DIR = Path(__file__).parent.absolute() / "data"
+DATABASE_DIR = Path.home() / "Data"
 DATABASE_PATH = DATABASE_DIR / DATABASE_NAME
 STATION_IDS = ("KSEA", "KBDU", "KORD", "KCMI", "KMRY", "KSAN", "KNYC", "KIND", "KHOU")
 
@@ -121,6 +121,7 @@ def to_database(stid, initialization_time, df):
     logger = get_run_logger()
 
     DATABASE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving data to {DATABASE_PATH}")
     with sqlite3.connect(DATABASE_PATH) as con:
         table_row = con.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{stid}';")
         table = table_row.fetchone()
