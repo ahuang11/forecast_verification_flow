@@ -122,12 +122,13 @@ def to_database(stid, initialization_time, df):
 
     DATABASE_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DATABASE_PATH) as con:
-        table = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='{stid}';").fetchone()
+        table_row = con.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{stid}';")
+        table = table_row.fetchone()
         if table is not None:
             row = con.execute(f"SELECT initialization_time FROM {stid} ORDER BY rowid DESC LIMIT 1;")
             existing_initialization_time = pd.to_datetime(row.fetchone()[0])
             if existing_initialization_time == initialization_time:
-                logger.info(f"{initialization_time} already exists in the database for {stid}, skipping")
+                logger.warning(f"{initialization_time} already exists in the database for {stid}, skipping")
                 return
 
         df.to_sql(stid, con, index=False, if_exists="append")
