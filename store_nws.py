@@ -121,7 +121,7 @@ def to_database(stid, initialization_time, df):
     logger = get_run_logger()
 
     DATABASE_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Saving data to {DATABASE_PATH}")
+    logger.info(f"Saving {stid} dataframe to {DATABASE_PATH}")
     with sqlite3.connect(DATABASE_PATH) as con:
         table_row = con.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{stid}';")
         table = table_row.fetchone()
