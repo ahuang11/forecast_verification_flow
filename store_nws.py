@@ -63,21 +63,6 @@ def extract_initialization_time(root):
     return initialization_time
 
 
-@task(retries=3, retry_delay_seconds=10)
-def check_if_exists(stid, initialization_time):
-    logger = get_run_logger()
-    try:
-        with sqlite3.connect(DATABASE_PATH) as con:
-            row = con.execute(f"SELECT initialization_time FROM {stid} ORDER BY rowid DESC LIMIT 1;")
-            existing_initialization_time = pd.to_datetime(row.fetchone()[0])
-            if existing_initialization_time == initialization_time:
-                logger.info(f"{initialization_time} already exists in the database for {stid}, skipping")
-                return True
-    except sqlite3.OperationalError:
-        pass
-    return False
-
-
 @task
 def extract_params(root):
     mapping = defaultdict(lambda: [])
@@ -132,9 +117,19 @@ def create_df(mapping, initialization_time):
 
 
 @task(retries=3, retry_delay_seconds=10)
-def to_database(stid, df):
+def to_database(stid, initialization_time, df):
+    logger = get_run_logger()
+
     DATABASE_DIR.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DATABASE_PATH) as con:
+        table = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='{stid}';").fetchone()
+        if table is not None:
+            row = con.execute(f"SELECT initialization_time FROM {stid} ORDER BY rowid DESC LIMIT 1;")
+            existing_initialization_time = pd.to_datetime(row.fetchone()[0])
+            if existing_initialization_time == initialization_time:
+                logger.info(f"{initialization_time} already exists in the database for {stid}, skipping")
+                return
+
         df.to_sql(stid, con, index=False, if_exists="append")
         for col in TEMPORAL_COLS:
             con.execute(f"CREATE INDEX IF NOT EXISTS {col}_index ON {stid}({col});")
@@ -150,12 +145,12 @@ def process_forecasts(stids: Tuple = STATION_IDS):
 
         data = retrieve_data(lon, lat)
         root = get_root(data)
+
         initialization_time = extract_initialization_time(root)
-        exists = check_if_exists(stid, initialization_time)
-        if not exists.result():
-            mapping = extract_params(root)
-            df = create_df(mapping, initialization_time)
-            to_database(stid, df)
+        mapping = extract_params(root)
+
+        df = create_df(mapping, initialization_time)
+        to_database(stid, initialization_time, df)
 
 
 DeploymentSpec(
