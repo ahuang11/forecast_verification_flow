@@ -12,6 +12,7 @@ from prefect import flow, task, get_run_logger
 from prefect.tasks import task_input_hash
 from prefect.orion.schemas.schedules import IntervalSchedule
 from prefect.deployments import DeploymentSpec
+from prefect.task_runners import SequentialTaskRunner
 
 
 META_URL = (
@@ -137,7 +138,7 @@ def to_database(stid, initialization_time, df):
             con.execute(f"CREATE INDEX IF NOT EXISTS {col}_index ON {stid}({col});")
 
 
-@flow
+@flow(task_runner=SequentialTaskRunner())
 def process_forecasts(stids: Tuple = STATION_IDS):
     for stid in stids:
         stid = stid.upper()
